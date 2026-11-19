@@ -1,10 +1,12 @@
-
 name: Build STUDIO PRO AI APK
 
 on:
   workflow_dispatch:
   push:
     branches: [main, master]
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -37,7 +39,253 @@ jobs:
       - name: Sync Android project
         run: npx cap sync android
 
-      - name: Build APK
+      - name: Create native editing engine
+        shell: bash
+        run: |
+          mkdir -p android/app/src/main/java/com/studioproai/rishi
+
+          cat > android/app/src/main/java/com/studioproai/rishi/StudioEnginePlugin.java <<'JAVA'
+          package com.studioproai.rishi;
+
+          import android.content.ContentValues;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.OutputStream;
+          import java.io.InputStream;
+
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          import androidx.media3.common.MediaItem;
+          import androidx.media3.transformer.Composition;
+          import androidx.media3.transformer.ExportException;
+          import androidx.media3.transformer.ExportResult;
+          import androidx.media3.transformer.Transformer;
+
+          @CapacitorPlugin(name = "StudioEngine")
+          public class StudioEnginePlugin extends Plugin {
+
+              private Transformer activeTransformer;
+
+              @PluginMethod
+              public void getEngineInfo(PluginCall call) {
+                  JSObject result = new JSObject();
+                  try {
+                      result.put("engine", "AndroidX Media3");
+                      result.put("version", "1.11.1");
+                      result.put("native", true);
+                      result.put("exportSupported", true);
+                      call.resolve(result);
+                  } catch (org.json.JSONException e) {
+                      call.reject("Could not read engine information", e);
+                  }
+              }
+
+              @PluginMethod
+              public void exportVideo(PluginCall call) {
+                  String input = call.getString("inputUri");
+
+                  if (input == null || input.trim().isEmpty()) {
+                      call.reject("A video inputUri is required");
+                      return;
+                  }
+
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                      call.reject("Public video export requires Android 10 or newer");
+                      return;
+                  }
+
+                  File output = new File(
+                      getContext().getCacheDir(),
+                      "studio_export_" + System.currentTimeMillis() + ".mp4"
+                  );
+
+                  try {
+                      activeTransformer = new Transformer.Builder(getContext())
+                          .addListener(new Transformer.Listener() {
+
+                              @Override
+                              public void onCompleted(
+                                  Composition composition,
+                                  ExportResult exportResult
+                              ) {
+                                  try {
+                                      Uri savedUri = saveToGallery(output);
+
+                                      JSObject result = new JSObject();
+                                      result.put("success", true);
+                                      result.put("uri", savedUri.toString());
+                                      result.put("fileName", "STUDIO_PRO_AI.mp4");
+
+                                      call.resolve(result);
+                                  } catch (Exception e) {
+                                      call.reject("Export completed but saving failed", e);
+                                  } finally {
+                                      output.delete();
+                                      activeTransformer = null;
+                                  }
+                              }
+
+                              @Override
+                              public void onError(
+                                  Composition composition,
+                                  ExportResult exportResult,
+                                  ExportException exception
+                              ) {
+                                  output.delete();
+                                  activeTransformer = null;
+                                  call.reject("Video rendering failed: " + exception.getMessage());
+                              }
+                          })
+                          .build();
+
+                      activeTransformer.start(
+                          MediaItem.fromUri(Uri.parse(input)),
+                          output.getAbsolutePath()
+                      );
+
+                  } catch (Exception e) {
+                      output.delete();
+                      activeTransformer = null;
+                      call.reject("Could not start video export", e);
+                  }
+              }
+
+              private Uri saveToGallery(File file) throws Exception {
+                  ContentValues values = new ContentValues();
+                  values.put(MediaStore.MediaColumns.DISPLAY_NAME,
+                      "STUDIO_PRO_AI_" + System.currentTimeMillis() + ".mp4");
+                  values.put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4");
+                  values.put(MediaStore.MediaColumns.RELATIVE_PATH,
+                      Environment.DIRECTORY_MOVIES + "/STUDIO PRO AI");
+                  values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
+                  Uri uri = getContext().getContentResolver().insert(
+                      MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
+                  );
+
+                  if (uri == null) {
+                      throw new Exception("Could not create gallery file");
+                  }
+
+                  try (InputStream in = new FileInputStream(file);
+                       OutputStream out = getContext().getContentResolver()
+                           .openOutputStream(uri)) {
+
+                      if (out == null) {
+                          throw new Exception("Could not open gallery output");
+                      }
+
+                      byte[] buffer = new byte[8192];
+                      int count;
+
+                      while ((count = in.read(buffer)) != -1) {
+                          out.write(buffer, 0, count);
+                      }
+                  } catch (Exception e) {
+                      getContext().getContentResolver().delete(uri, null, null);
+                      throw e;
+                  }
+
+                  ContentValues finished = new ContentValues();
+                  finished.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                  getContext().getContentResolver().update(uri, finished, null, null);
+
+                  return uri;
+              }
+          }
+          JAVA
+
+      - name: Register native plugin and Media3
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path("android/app/src/main")
+          files = list(root.rglob("MainActivity.java")) + list(root.rglob("MainActivity.kt"))
+
+          if not files:
+              raise SystemExit("MainActivity was not generated")
+
+          activity = files[0]
+          source = activity.read_text()
+
+          if activity.suffix == ".java":
+              registration = "registerPlugin(StudioEnginePlugin.class);"
+              if registration not in source:
+                  source = re.sub(
+                      r"(super\.onCreate\(savedInstanceState\);)",
+                      registration + "\n        \\1",
+                      source,
+                      count=1
+                  )
+                  if registration not in source:
+                      raise SystemExit("Could not register Java plugin")
+
+                  source = re.sub(
+                      r"(package [^;]+;)",
+                      r"\1\n\nimport com.studioproai.rishi.StudioEnginePlugin;",
+                      source,
+                      count=1
+                  )
+
+          else:
+              registration = "registerPlugin(StudioEnginePlugin::class.java)"
+              if registration not in source:
+                  source = re.sub(
+                      r"(super\.onCreate\(savedInstanceState\))",
+                      registration + "\n        \\1",
+                      source,
+                      count=1
+                  )
+                  if registration not in source:
+                      raise SystemExit("Could not register Kotlin plugin")
+
+                  source = re.sub(
+                      r"(package [^\n]+)",
+                      r"\1\n\nimport com.studioproai.rishi.StudioEnginePlugin",
+                      source,
+                      count=1
+                  )
+
+          activity.write_text(source)
+
+          gradle = Path("android/app/build.gradle")
+          if not gradle.exists():
+              gradle = Path("android/app/build.gradle.kts")
+
+          if not gradle.exists():
+              raise SystemExit("App Gradle file not found")
+
+          text = gradle.read_text()
+
+          dependency = (
+              'implementation "androidx.media3:media3-transformer:1.11.1"'
+              if gradle.suffix == ".gradle"
+              else 'implementation("androidx.media3:media3-transformer:1.11.1")'
+          )
+
+          if "media3-transformer" not in text:
+              match = re.search(r"dependencies\s*\{", text)
+              if not match:
+                  raise SystemExit("Gradle dependencies block not found")
+              position = match.end()
+              text = text[:position] + "\n    " + dependency + text[position:]
+
+          gradle.write_text(text)
+          print("Native plugin registered and Media3 dependency added.")
+          PY
+
+      - name: Build Android APK
         run: |
           cd android
           chmod +x gradlew
@@ -48,4 +296,6 @@ jobs:
         with:
           name: STUDIO-PRO-AI-APK
           path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
           
