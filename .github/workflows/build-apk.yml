@@ -218,85 +218,12 @@ jobs:
 
           activity = files[0]
           source = activity.read_text()
-if activity.suffix == ".java":
-    if "import android.os.Bundle;" not in source:
-        source = re.sub(
-            r"(package [^;]+;)",
-            r"\1\n\nimport android.os.Bundle;",
-            source,
-            count=1
-        )
+        root = Path("android/app/src/main")
 
-    registration = "registerPlugin(StudioEnginePlugin.class);"
-
-    if registration not in source:
-        on_create = re.search(
-            r"public\s+void\s+onCreate\s*\([^)]*\)\s*\{",
-            source
-        )
-
-        if on_create:
-            rest = source[on_create.end():]
-            super_call = re.search(
-                r"super\.onCreate\(savedInstanceState\);",
-                rest
-            )
-
-            position = (
-                on_create.end() + super_call.start()
-                if super_call else on_create.end()
-            )
-
-            source = (
-                source[:position]
-                + "\n        " + registration + "\n        "
-                + source[position:]
-            )
+        if activity.suffix == ".java":
+            # Java registration code
         else:
-            method = """
-    @Override
-    public void onCreate(Bundle savedInstanceState) {
-        registerPlugin(StudioEnginePlugin.class);
-        super.onCreate(savedInstanceState);
-    }
-"""
-            source, count = re.subn(
-                r"\}\s*$",
-                method + "\n}",
-                source,
-                count=1
-            )
-
-            if count != 1:
-                raise SystemExit("Could not create MainActivity onCreate method")
-
-    if "import com.studioproai.rishi.StudioEnginePlugin;" not in source:
-        source = re.sub(
-            r"(package [^;]+;)",
-            r"\1\n\nimport com.studioproai.rishi.StudioEnginePlugin;",
-            source,
-            count=1
-        )
-
-
-          else:
-              registration = "registerPlugin(StudioEnginePlugin::class.java)"
-              if registration not in source:
-                  source = re.sub(
-                      r"(super\.onCreate\(savedInstanceState\))",
-                      registration + "\n        \\1",
-                      source,
-                      count=1
-                  )
-                  if registration not in source:
-                      raise SystemExit("Could not register Kotlin plugin")
-
-                  source = re.sub(
-                      r"(package [^\n]+)",
-                      r"\1\n\nimport com.studioproai.rishi.StudioEnginePlugin",
-                      source,
-                      count=1
-                  )
+            # Kotlin registration code
 
           activity.write_text(source)
 
